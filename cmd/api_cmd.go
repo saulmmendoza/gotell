@@ -5,13 +5,13 @@ import (
 	"net/http"
 	"strings"
 
-	"code.gitea.io/sdk/gitea"
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/sqlite"
 	"github.com/sirupsen/logrus"
 	"github.com/netlify/gotell/api"
 	"github.com/netlify/gotell/conf"
 	"github.com/netlify/gotell/models"
+	"github.com/netlify/gotell/providers"
 	"github.com/spf13/cobra"
 )
 
@@ -42,12 +42,12 @@ func serveAPI(config *conf.Configuration) {
 
 	db.AutoMigrate(&models.Instance{})
 
-	giteaClient := newGiteaClient(config)
-	if err := verifyRepoAndToken(config.API.Repository, giteaClient); err != nil {
+	provider := newGitProvider(config)
+	if err := verifyRepoAndToken(config.API.Repository, provider); err != nil {
 		logrus.Fatalf("Error verifying repo: %v", err)
 	}
 
-	server := api.NewServerWithVersion(config, giteaClient, db, Version)
+	server := api.NewServerWithVersion(config, provider, db, Version)
 	server.ListenAndServe()
 }
 
@@ -78,24 +78,33 @@ func verifySite(url string) error {
 	return nil
 }
 
-func verifyRepoAndToken(repository string, client *gitea.Client) error {
+func verifyRepoAndToken(repository string, client providers.GitProvider) error {
 	parts := strings.Split(repository, "/")
 	if len(parts) != 2 {
 		return fmt.Errorf("Repo format must be owner/repo - %v", repository)
 	}
 
-	_, _, err := client.GetRepo(parts[0], parts[1])
+	err := client.GetRepo(parts[0], parts[1])
 	return err
 }
 
-func newGiteaClient(config *conf.Configuration) *gitea.Client {
-	forgejoURL := config.API.ForgejoURL
-	if forgejoURL == "" {
-		forgejoURL = "https://v15.next.forgejo.org"
+func newGitProvider(config *conf.Configuration) providers.GitProvider {
+	serverURL := config.API.ServerURL
+	if serverURL == "" {
+		serverURL = "https://v15.next.forgejo.org"
 	}
-	client, err := gitea.NewClient(forgejoURL, gitea.SetToken(config.API.AccessToken))
+
+	var client providers.GitProvider
+	var err error
+
+	if config.API.Provider == "forgejo" {
+		client, err = providers.NewForgejoProvider(serverURL, config.API.AccessToken)
+	} else {
+		client, err = providers.NewGiteaProvider(serverURL, config.API.AccessToken)
+	}
+
 	if err != nil {
-		logrus.Fatalf("Error creating gitea client: %v", err)
+		logrus.Fatalf("Error creating git provider: %v", err)
 	}
 	return client
 }

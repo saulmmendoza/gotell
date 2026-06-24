@@ -20,7 +20,8 @@ type Configuration struct {
 
 	API struct {
 		SiteURL     string `mapstructure:"site_url" json:"site_url"`
-		ForgejoURL  string `mapstructure:"forgejo_url" json:"forgejo_url"`
+		Provider    string `mapstructure:"provider" json:"provider"` // gitea or forgejo
+		ServerURL   string `mapstructure:"server_url" json:"server_url"` // the url of the gitea/forgejo server
 		Repository  string `mapstructure:"repository" json:"repository"`
 		AccessToken string `mapstructure:"access_token" json:"access_token"`
 		Host        string `mapstructure:"host" json:"host"`
@@ -56,6 +57,7 @@ func LoadConfig(cmd *cobra.Command) (*Configuration, error) {
 	viper.SetDefault("threads.port", "9091")
 	viper.SetDefault("db.driver", "sqlite3")
 	viper.SetDefault("db.url", "gotell.db")
+	viper.SetDefault("api.provider", "gitea")
 
 	if os.Getenv("PORT") == "" {
 		viper.SetDefault("api.port", "9090")

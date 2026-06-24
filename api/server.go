@@ -17,9 +17,9 @@ import (
 	"github.com/jinzhu/gorm"
 	"github.com/sirupsen/logrus"
 	jwt "github.com/dgrijalva/jwt-go"
-	"code.gitea.io/sdk/gitea"
 	"github.com/netlify/gotell/comments"
 	"github.com/netlify/gotell/conf"
+	"github.com/netlify/gotell/providers"
 	"github.com/rs/cors"
 	"github.com/zenazn/goji/web/mutil"
 )
@@ -34,7 +34,7 @@ var bearerRegexp = regexp.MustCompile(`^(?:B|b)earer (\S+$)`)
 type Server struct {
 	handler  http.Handler
 	config   *conf.Configuration
-	client   *gitea.Client
+	client   providers.GitProvider
 	db       *gorm.DB
 	settings *settings
 	mutex    sync.Mutex
@@ -70,19 +70,36 @@ func (s *Server) postComment(w http.ResponseWriter, req *http.Request) {
 		instanceConfig, err := instance.Config()
 		if err == nil && instanceConfig != nil {
 			config = instanceConfig
-			forgejoURL := config.API.ForgejoURL
-			if forgejoURL == "" {
-				forgejoURL = "https://v15.next.forgejo.org"
+			serverURL := config.API.ServerURL
+			if serverURL == "" {
+				serverURL = "https://v15.next.forgejo.org"
 			}
-			newClient, err := gitea.NewClient(forgejoURL, gitea.SetToken(config.API.AccessToken))
-			if err == nil {
+
+			var newClient providers.GitProvider
+			var clientErr error
+			if config.API.Provider == "forgejo" {
+				newClient, clientErr = providers.NewForgejoProvider(serverURL, config.API.AccessToken)
+			} else {
+				newClient, clientErr = providers.NewGiteaProvider(serverURL, config.API.AccessToken)
+			}
+
+			if clientErr == nil {
 				client = newClient
 			}
 		}
 	}
 
-	settings := s.getSettings() // We might want to pass config here too if it uses config.API.SiteURL.
-	// Actually s.getSettings uses s.config.API.SiteURL, let's just make it use the local config
+	baseSettings := s.getSettings()
+	// Deep copy to prevent data races when mutating for an instance
+	settings := &settings{
+		BannedIPs:       append([]string{}, baseSettings.BannedIPs...),
+		BannedKeywords:  append([]string{}, baseSettings.BannedKeywords...),
+		BannedEmails:    append([]string{}, baseSettings.BannedEmails...),
+		RequireApproval: baseSettings.RequireApproval,
+		TimeLimit:       baseSettings.TimeLimit,
+		lastLoad:        baseSettings.lastLoad,
+	}
+
 	if instance != nil {
 		resp, err := http.Get(config.API.SiteURL + "/gotell/settings.json")
 		if err == nil {
@@ -172,27 +189,25 @@ func (s *Server) postComment(w http.ResponseWriter, req *http.Request) {
 
 	if settings.RequireApproval || comment.IsSuspicious() {
 		branch = "comment-" + comment.ID
-		master, _, err := client.GetRepoBranch(parts[0], parts[1], "master")
+		master, err := client.GetRepoBranch(parts[0], parts[1], "master")
 		if err != nil {
 			jsonError(w, fmt.Sprintf("Failed to write comment: %v", err), 500)
 			return
 		}
 
-		_, _, err = client.CreateBranch(parts[0], parts[1], gitea.CreateBranchOption{
-			BranchName:    branch,
-			OldBranchName: "master",
-		})
+		err = client.CreateBranch(parts[0], parts[1], branch, "master")
 		if err != nil {
+			logrus.Warnf("Could not create branch (it might already exist or API error): %v", err)
 		}
 
 		encodedContent := base64.StdEncoding.EncodeToString(content)
-		_, _, err = client.CreateFile(parts[0], parts[1], pathname, gitea.CreateFileOptions{
-			FileOptions: gitea.FileOptions{
+		err = client.CreateFile(parts[0], parts[1], pathname, providers.CreateFileOptions{
+			FileOptions: providers.FileOptions{
 				Message:       message,
 				BranchName:    branch,
 				NewBranchName: branch,
 			},
-			Content: encodedContent,
+			ContentBase64: encodedContent,
 		})
 
 		if err != nil {
@@ -200,25 +215,25 @@ func (s *Server) postComment(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 
-		pr := gitea.CreatePullRequestOption{
+		pr := providers.CreatePullRequestOption{
 			Title: message,
 			Head:  branch,
 			Base:  master.Name,
 			Body:  comment.Body,
 		}
-		_, _, err = client.CreatePullRequest(parts[0], parts[1], pr)
+		err = client.CreatePullRequest(parts[0], parts[1], pr)
 		if err != nil {
 			jsonError(w, fmt.Sprintf("Failed to create PR: %v", err), 500)
 			return
 		}
 	} else {
 		encodedContent := base64.StdEncoding.EncodeToString(content)
-		_, _, err := client.CreateFile(parts[0], parts[1], pathname, gitea.CreateFileOptions{
-			FileOptions: gitea.FileOptions{
+		err := client.CreateFile(parts[0], parts[1], pathname, providers.CreateFileOptions{
+			FileOptions: providers.FileOptions{
 				Message:    message,
 				BranchName: branch,
 			},
-			Content: encodedContent,
+			ContentBase64: encodedContent,
 		})
 
 		if err != nil {
@@ -345,14 +360,14 @@ func (s *Server) ListenAndServe() error {
 	return http.ListenAndServe(l, s.handler)
 }
 
-func NewServer(config *conf.Configuration, giteaClient *gitea.Client, db *gorm.DB) *Server {
-	return NewServerWithVersion(config, giteaClient, db, defaultVersion)
+func NewServer(config *conf.Configuration, provider providers.GitProvider, db *gorm.DB) *Server {
+	return NewServerWithVersion(config, provider, db, defaultVersion)
 }
 
-func NewServerWithVersion(config *conf.Configuration, giteaClient *gitea.Client, db *gorm.DB, version string) *Server {
+func NewServerWithVersion(config *conf.Configuration, provider providers.GitProvider, db *gorm.DB, version string) *Server {
 	s := &Server{
 		config:  config,
-		client:  giteaClient,
+		client:  provider,
 		db:      db,
 		version: version,
 	}
