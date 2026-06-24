@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/netlify/gotell/conf"
 )
 
 var cleanPathRE = regexp.MustCompile("(^-+|-+$)")
@@ -19,7 +20,11 @@ type entryData struct {
 }
 
 func (s *Server) entryData(path string) (*entryData, error) {
-	resp, err := http.Get(s.config.API.SiteURL + path)
+	return s.entryDataConfig(path, s.config)
+}
+
+func (s *Server) entryDataConfig(path string, config *conf.Configuration) (*entryData, error) {
+	resp, err := http.Get(config.API.SiteURL + path)
 	if err != nil {
 		return nil, err
 	}

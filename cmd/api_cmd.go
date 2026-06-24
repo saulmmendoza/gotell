@@ -1,17 +1,17 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"strings"
 
-	"golang.org/x/oauth2"
-
-	"github.com/Sirupsen/logrus"
-	"github.com/google/go-github/github"
+	"github.com/jinzhu/gorm"
+	_ "github.com/jinzhu/gorm/dialects/sqlite"
+	"github.com/sirupsen/logrus"
 	"github.com/netlify/gotell/api"
 	"github.com/netlify/gotell/conf"
+	"github.com/netlify/gotell/models"
+	"github.com/netlify/gotell/providers"
 	"github.com/spf13/cobra"
 )
 
@@ -34,12 +34,20 @@ func serveAPI(config *conf.Configuration) {
 		logrus.Fatalf("Error verifying site: %v", err)
 	}
 
-	githubClient := newGitHubClient(config)
-	if err := verifyRepoAndToken(config.API.Repository, githubClient); err != nil {
+	db, err := gorm.Open(config.DB.Driver, config.DB.URL)
+	if err != nil {
+		logrus.Fatalf("Error opening database: %v", err)
+	}
+	defer db.Close()
+
+	db.AutoMigrate(&models.Instance{})
+
+	provider := newGitProvider(config)
+	if err := verifyRepoAndToken(config.API.Repository, provider); err != nil {
 		logrus.Fatalf("Error verifying repo: %v", err)
 	}
 
-	server := api.NewServerWithVersion(config, githubClient, Version)
+	server := api.NewServerWithVersion(config, provider, db, Version)
 	server.ListenAndServe()
 }
 
@@ -70,21 +78,33 @@ func verifySite(url string) error {
 	return nil
 }
 
-func verifyRepoAndToken(repository string, client *github.Client) error {
+func verifyRepoAndToken(repository string, client providers.GitProvider) error {
 	parts := strings.Split(repository, "/")
 	if len(parts) != 2 {
 		return fmt.Errorf("Repo format must be owner/repo - %v", repository)
 	}
-	ctx := context.Background()
 
-	_, _, err := client.Repositories.Get(ctx, parts[0], parts[1])
+	err := client.GetRepo(parts[0], parts[1])
 	return err
 }
 
-func newGitHubClient(config *conf.Configuration) *github.Client {
-	ts := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: config.API.AccessToken},
-	)
-	tc := oauth2.NewClient(oauth2.NoContext, ts)
-	return github.NewClient(tc)
+func newGitProvider(config *conf.Configuration) providers.GitProvider {
+	serverURL := config.API.ServerURL
+	if serverURL == "" {
+		serverURL = "https://v15.next.forgejo.org"
+	}
+
+	var client providers.GitProvider
+	var err error
+
+	if config.API.Provider == "forgejo" {
+		client, err = providers.NewForgejoProvider(serverURL, config.API.AccessToken)
+	} else {
+		client, err = providers.NewGiteaProvider(serverURL, config.API.AccessToken)
+	}
+
+	if err != nil {
+		logrus.Fatalf("Error creating git provider: %v", err)
+	}
+	return client
 }

@@ -5,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -20,6 +20,8 @@ type Configuration struct {
 
 	API struct {
 		SiteURL     string `mapstructure:"site_url" json:"site_url"`
+		Provider    string `mapstructure:"provider" json:"provider"` // gitea or forgejo
+		ServerURL   string `mapstructure:"server_url" json:"server_url"` // the url of the gitea/forgejo server
 		Repository  string `mapstructure:"repository" json:"repository"`
 		AccessToken string `mapstructure:"access_token" json:"access_token"`
 		Host        string `mapstructure:"host" json:"host"`
@@ -31,9 +33,16 @@ type Configuration struct {
 		File  string `mapstructure:"file" json:"file"`
 	} `mapstructure:"logging" json:"logging"`
 
+	DB struct {
+		Driver string `mapstructure:"driver" json:"driver"`
+		URL    string `mapstructure:"url" json:"url"`
+	} `mapstructure:"db" json:"db"`
+
 	JWT struct {
 		Secret string `mapstructure:"secret" json:"secret"`
 	} `mapstructure:"jwt" json:"jwt"`
+
+	OperatorToken string `mapstructure:"operator_token" json:"operator_token"`
 }
 
 func LoadConfig(cmd *cobra.Command) (*Configuration, error) {
@@ -46,6 +55,9 @@ func LoadConfig(cmd *cobra.Command) (*Configuration, error) {
 	viper.SetDefault("threads.source", "threads")
 	viper.SetDefault("threads.destination", "dist")
 	viper.SetDefault("threads.port", "9091")
+	viper.SetDefault("db.driver", "sqlite3")
+	viper.SetDefault("db.url", "gotell.db")
+	viper.SetDefault("api.provider", "gitea")
 
 	if os.Getenv("PORT") == "" {
 		viper.SetDefault("api.port", "9090")

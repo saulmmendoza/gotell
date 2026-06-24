@@ -1,0 +1,116 @@
+openapi: 3.0.3
+info:
+  title: GoTell API
+  description: A commenting system for JAMstack sites.
+  version: 1.0.0
+servers:
+  - url: http://localhost:9090
+paths:
+  /:
+    get:
+      summary: Index Endpoint
+      description: Returns API metadata.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: string
+                  name:
+                    type: string
+                  description:
+                    type: string
+  /instances:
+    post:
+      summary: Create an instance
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                uuid:
+                  type: string
+                config:
+                  type: object
+      responses:
+        '201':
+          description: Instance created
+  /instances/{instance_id}:
+    get:
+      summary: Get an instance
+      parameters:
+        - in: path
+          name: instance_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+    put:
+      summary: Update an instance
+      parameters:
+        - in: path
+          name: instance_id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                config:
+                  type: object
+      responses:
+        '200':
+          description: OK
+    delete:
+      summary: Delete an instance
+      parameters:
+        - in: path
+          name: instance_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: No Content
+  /{path}:
+    post:
+      summary: Post a comment
+      description: Post a new comment to the thread matching the path.
+      parameters:
+        - in: path
+          name: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                author:
+                  type: string
+                email:
+                  type: string
+                www:
+                  type: string
+                body:
+                  type: string
+      responses:
+        '200':
+          description: OK
+        '422':
+          description: Unprocessable Entity
