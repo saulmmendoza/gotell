@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,10 +12,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Sirupsen/logrus"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jinzhu/gorm"
+	"github.com/sirupsen/logrus"
 	jwt "github.com/dgrijalva/jwt-go"
-	"github.com/google/go-github/github"
-	"github.com/guregu/kami"
+	"code.gitea.io/sdk/gitea"
 	"github.com/netlify/gotell/comments"
 	"github.com/netlify/gotell/conf"
 	"github.com/rs/cors"
@@ -31,7 +34,8 @@ var bearerRegexp = regexp.MustCompile(`^(?:B|b)earer (\S+$)`)
 type Server struct {
 	handler  http.Handler
 	config   *conf.Configuration
-	client   *github.Client
+	client   *gitea.Client
+	db       *gorm.DB
 	settings *settings
 	mutex    sync.Mutex
 	version  string
@@ -44,12 +48,63 @@ func Min(x, y int) int {
 	return y
 }
 
-func (s *Server) postComment(ctx context.Context, w http.ResponseWriter, req *http.Request) {
+func (s *Server) postComment(w http.ResponseWriter, req *http.Request) {
 	entryPath := req.URL.Path
+	if chi.RouteContext(req.Context()) != nil && chi.RouteContext(req.Context()).RoutePattern() != "" {
+		// When mounted under /instances/{instance_id}, chi doesn't strip the prefix automatically in URL.Path
+		// The actual comment path parameter from chi might be "*"
+		// Let's extract the '*' path param which represents the original requested path after instances/{instance_id}/
+		paramPath := chi.URLParam(req, "*")
+		if paramPath != "" {
+			entryPath = "/" + paramPath
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 
-	settings := s.getSettings()
+	// Get instance client and configuration
+	client := s.client
+	config := s.config
+	instance := getInstance(req.Context())
+	if instance != nil {
+		instanceConfig, err := instance.Config()
+		if err == nil && instanceConfig != nil {
+			config = instanceConfig
+			forgejoURL := config.API.ForgejoURL
+			if forgejoURL == "" {
+				forgejoURL = "https://v15.next.forgejo.org"
+			}
+			newClient, err := gitea.NewClient(forgejoURL, gitea.SetToken(config.API.AccessToken))
+			if err == nil {
+				client = newClient
+			}
+		}
+	}
+
+	settings := s.getSettings() // We might want to pass config here too if it uses config.API.SiteURL.
+	// Actually s.getSettings uses s.config.API.SiteURL, let's just make it use the local config
+	if instance != nil {
+		resp, err := http.Get(config.API.SiteURL + "/gotell/settings.json")
+		if err == nil {
+			defer resp.Body.Close()
+			type settingsStruct struct {
+				BannedIPs       []string `json:"banned_ips"`
+				BannedKeywords  []string `json:"banned_keywords"`
+				BannedEmails    []string `json:"banned_emails"`
+				RequireApproval bool     `json:"require_approval"`
+				TimeLimit       int      `json:"timelimit"`
+			}
+			st := &settingsStruct{}
+			if json.NewDecoder(resp.Body).Decode(st) == nil {
+				settings.BannedIPs = st.BannedIPs
+				settings.BannedKeywords = st.BannedKeywords
+				settings.BannedEmails = st.BannedEmails
+				settings.RequireApproval = st.RequireApproval
+				settings.TimeLimit = st.TimeLimit
+			}
+		}
+	}
+
 	for _, ip := range settings.BannedIPs {
 		if req.RemoteAddr == ip {
 			w.Header().Add("X-Banned", "IP-Banned")
@@ -58,7 +113,7 @@ func (s *Server) postComment(ctx context.Context, w http.ResponseWriter, req *ht
 		}
 	}
 
-	entryData, err := s.entryData(entryPath)
+	entryData, err := s.entryDataConfig(entryPath, config)
 	if err != nil {
 		jsonError(w, fmt.Sprintf("Unable to read entry data: %v", err), 400)
 		return
@@ -96,14 +151,14 @@ func (s *Server) postComment(ctx context.Context, w http.ResponseWriter, req *ht
 	comment.ID = fmt.Sprintf("%v", time.Now().UnixNano())
 	comment.Verified = s.verify(comment.Email, req)
 
-	parts := strings.Split(s.config.API.Repository, "/")
+	parts := strings.Split(config.API.Repository, "/")
 	matches := threadRegexp.FindStringSubmatch(entryData.Thread)
 	dir := matches[1] + "/" + matches[2] + "/" + matches[3]
 	firstParagraph := strings.SplitAfterN(strings.ToLower(strings.TrimSpace(comment.Body[0:len(comment.Body)])), "\n", 1)[0]
 	name := squeeze.ReplaceAllString(strings.Trim(slugify.ReplaceAllString(firstParagraph[0:Min(50, len(firstParagraph))], "-"), "-"), "-")
 
 	pathname := path.Join(
-		s.config.Threads.Source,
+		config.Threads.Source,
 		dir,
 		fmt.Sprintf("%v-%v.json", (time.Now().UnixNano()/1000000), name),
 	)
@@ -117,26 +172,27 @@ func (s *Server) postComment(ctx context.Context, w http.ResponseWriter, req *ht
 
 	if settings.RequireApproval || comment.IsSuspicious() {
 		branch = "comment-" + comment.ID
-		master, _, err := s.client.Repositories.GetBranch(ctx, parts[0], parts[1], "master")
-		sha := master.Commit.GetSHA()
-		refName := "refs/heads/" + branch
+		master, _, err := client.GetRepoBranch(parts[0], parts[1], "master")
 		if err != nil {
 			jsonError(w, fmt.Sprintf("Failed to write comment: %v", err), 500)
 			return
 		}
 
-		_, _, err = s.client.Git.CreateRef(ctx, parts[0], parts[1], &github.Reference{
-			Ref:    &refName,
-			Object: &github.GitObject{SHA: &sha},
+		_, _, err = client.CreateBranch(parts[0], parts[1], gitea.CreateBranchOption{
+			BranchName:    branch,
+			OldBranchName: "master",
 		})
 		if err != nil {
-			jsonError(w, fmt.Sprintf("Failed to create comment branch: %v", err), 500)
-			return
 		}
-		_, _, err = s.client.Repositories.CreateFile(ctx, parts[0], parts[1], pathname, &github.RepositoryContentFileOptions{
-			Message: &message,
-			Content: content,
-			Branch:  &branch,
+
+		encodedContent := base64.StdEncoding.EncodeToString(content)
+		_, _, err = client.CreateFile(parts[0], parts[1], pathname, gitea.CreateFileOptions{
+			FileOptions: gitea.FileOptions{
+				Message:       message,
+				BranchName:    branch,
+				NewBranchName: branch,
+			},
+			Content: encodedContent,
 		})
 
 		if err != nil {
@@ -144,21 +200,25 @@ func (s *Server) postComment(ctx context.Context, w http.ResponseWriter, req *ht
 			return
 		}
 
-		pr := &github.NewPullRequest{
-			Title: &message,
-			Head:  &branch,
+		pr := gitea.CreatePullRequestOption{
+			Title: message,
+			Head:  branch,
 			Base:  master.Name,
+			Body:  comment.Body,
 		}
-		_, _, err = s.client.PullRequests.Create(ctx, parts[0], parts[1], pr)
+		_, _, err = client.CreatePullRequest(parts[0], parts[1], pr)
 		if err != nil {
 			jsonError(w, fmt.Sprintf("Failed to create PR: %v", err), 500)
 			return
 		}
 	} else {
-		_, _, err = s.client.Repositories.CreateFile(ctx, parts[0], parts[1], pathname, &github.RepositoryContentFileOptions{
-			Message: &message,
-			Content: content,
-			Branch:  &branch,
+		encodedContent := base64.StdEncoding.EncodeToString(content)
+		_, _, err := client.CreateFile(parts[0], parts[1], pathname, gitea.CreateFileOptions{
+			FileOptions: gitea.FileOptions{
+				Message:    message,
+				BranchName: branch,
+			},
+			Content: encodedContent,
 		})
 
 		if err != nil {
@@ -172,24 +232,88 @@ func (s *Server) postComment(ctx context.Context, w http.ResponseWriter, req *ht
 	w.Write(response)
 }
 
-func (s *Server) verify(email string, r *http.Request) bool {
+func (s *Server) extractBearerToken(r *http.Request) (string, error) {
 	authHeader := r.Header.Get("Authorization")
 	if authHeader == "" {
-		logrus.Info("No auth header")
-		return false
+		return "", nil
 	}
 
 	matches := bearerRegexp.FindStringSubmatch(authHeader)
 	if len(matches) != 2 {
-		logrus.Info("Not a bearer auth header")
+		return "", fmt.Errorf("Invalid auth header format: %s", authHeader)
+	}
+
+	return matches[1], nil
+}
+
+func (s *Server) requireOperator(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bearerToken, err := s.extractBearerToken(r)
+		if err != nil || bearerToken == "" {
+			jsonError(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		if bearerToken == s.config.OperatorToken && s.config.OperatorToken != "" {
+			// Authorized as Operator
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		token, err := jwt.Parse(bearerToken, func(token *jwt.Token) (interface{}, error) {
+			if token.Method.Alg() != jwt.SigningMethodHS256.Name {
+				return nil, fmt.Errorf("Unexpected signing method: %v", token.Method.Alg())
+			}
+			return []byte(s.config.JWT.Secret), nil
+		})
+		if err != nil {
+			jsonError(w, "Invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+			appMetadata, ok := claims["app_metadata"].(map[string]interface{})
+			if ok {
+				roles, ok := appMetadata["roles"].([]interface{})
+				if ok {
+					for _, roleRaw := range roles {
+						if roleStr, ok := roleRaw.(string); ok && roleStr == "admin" {
+							next.ServeHTTP(w, r)
+							return
+						}
+					}
+				}
+			}
+		}
+
+		jsonError(w, "Unauthorized operator token", http.StatusUnauthorized)
+	})
+}
+
+func (s *Server) verify(email string, r *http.Request) bool {
+	bearerToken, err := s.extractBearerToken(r)
+	if err != nil || bearerToken == "" {
+		logrus.Info("No or invalid auth header")
 		return false
 	}
 
-	token, err := jwt.Parse(matches[1], func(token *jwt.Token) (interface{}, error) {
+	if bearerToken == s.config.OperatorToken && s.config.OperatorToken != "" {
+		logrus.Info("Making operator request")
+		return true
+	}
+
+	config := s.config
+	if instance := getInstance(r.Context()); instance != nil {
+		if instanceConfig, err := instance.Config(); err == nil && instanceConfig != nil {
+			config = instanceConfig
+		}
+	}
+
+	token, err := jwt.Parse(bearerToken, func(token *jwt.Token) (interface{}, error) {
 		if token.Method.Alg() != jwt.SigningMethodHS256.Name {
 			return nil, fmt.Errorf("Unexpected signing method: %v", token.Method.Alg())
 		}
-		return []byte(s.config.JWT.Secret), nil
+		return []byte(config.JWT.Secret), nil
 	})
 	if err != nil {
 		logrus.Errorf("Error verifying JWT: %v", err)
@@ -221,23 +345,23 @@ func (s *Server) ListenAndServe() error {
 	return http.ListenAndServe(l, s.handler)
 }
 
-func NewServer(config *conf.Configuration, githubClient *github.Client) *Server {
-	return NewServerWithVersion(config, githubClient, defaultVersion)
+func NewServer(config *conf.Configuration, giteaClient *gitea.Client, db *gorm.DB) *Server {
+	return NewServerWithVersion(config, giteaClient, db, defaultVersion)
 }
 
-func NewServerWithVersion(config *conf.Configuration, githubClient *github.Client, version string) *Server {
+func NewServerWithVersion(config *conf.Configuration, giteaClient *gitea.Client, db *gorm.DB, version string) *Server {
 	s := &Server{
 		config:  config,
-		client:  githubClient,
+		client:  giteaClient,
+		db:      db,
 		version: version,
 	}
 
-	mux := kami.New()
-	mux.LogHandler = logHandler
-	mux.Use("/", timeRequest)
-	mux.Use("/", jsonTypeRequired)
-	mux.Get("/", s.index)
-	mux.Post("/*path", s.postComment)
+	mux := chi.NewRouter()
+	mux.Use(middleware.RequestID)
+	mux.Use(middleware.RealIP)
+	mux.Use(middleware.Logger)
+	mux.Use(middleware.Recoverer)
 
 	corsHandler := cors.New(cors.Options{
 		AllowedMethods:   []string{"GET", "POST", "PATCH", "PUT", "DELETE"},
@@ -246,16 +370,40 @@ func NewServerWithVersion(config *conf.Configuration, githubClient *github.Clien
 		AllowCredentials: true,
 	})
 
-	s.handler = corsHandler.Handler(mux)
+	mux.Use(corsHandler.Handler)
+	mux.Use(timeRequestChi)
+
+	mux.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		s.index(r.Context(), w, r)
+	})
+
+	mux.With(s.requireOperator).Post("/instances", s.CreateInstance)
+
+	mux.Route("/instances/{instance_id}", func(r chi.Router) {
+		r.Use(s.instanceMiddleware)
+		r.With(s.requireOperator).Get("/", s.GetInstance)
+		r.With(s.requireOperator).Put("/", s.UpdateInstance)
+		r.With(s.requireOperator).Delete("/", s.DeleteInstance)
+
+		r.With(jsonTypeRequiredChi).Post("/*", s.postComment)
+	})
+
+	// Legacy route support without instance
+	mux.With(jsonTypeRequiredChi).Post("/*", s.postComment)
+
+	s.handler = mux
 	return s
 }
 
-func timeRequest(ctx context.Context, w http.ResponseWriter, r *http.Request) context.Context {
-	return context.WithValue(ctx, "_gotell_timing", time.Now())
+func timeRequestChi(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), contextKey("_gotell_timing"), time.Now())
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func logHandler(ctx context.Context, wp mutil.WriterProxy, req *http.Request) {
-	start := ctx.Value("_gotell_timing").(time.Time)
+	start := ctx.Value(contextKey("_gotell_timing")).(time.Time)
 	logrus.WithFields(logrus.Fields{
 		"method":   req.Method,
 		"path":     req.URL.Path,
@@ -264,12 +412,14 @@ func logHandler(ctx context.Context, wp mutil.WriterProxy, req *http.Request) {
 	}).Info("")
 }
 
-func jsonTypeRequired(ctx context.Context, w http.ResponseWriter, r *http.Request) context.Context {
-	if r.Method == "POST" && r.Header.Get("Content-Type") != "application/json" {
-		http.Error(w, "Content-Type must be application/json", 422)
-		return nil
-	}
-	return ctx
+func jsonTypeRequiredChi(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && r.Header.Get("Content-Type") != "application/json" {
+			http.Error(w, "Content-Type must be application/json", 422)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func sendJSON(w http.ResponseWriter, status int, obj interface{}) {
